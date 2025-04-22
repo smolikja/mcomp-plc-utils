@@ -6,6 +6,12 @@ library;
 
 export 'package:mcomp_plc_utils/src/config_fetcher/config_fetcher.dart'
     show ConfigFetcher;
+export 'package:mcomp_plc_utils/src/config_fetcher/models/plc_config.dart'
+    show PlcConfig, DefaultPlcConfig;
+export 'package:mcomp_plc_utils/src/config_fetcher/repository/config_repository.dart'
+    show ConfigRepository;
+export 'package:mcomp_plc_utils/src/config_fetcher/cache/config_cache.dart'
+    show ConfigCache;
 
 // MARK: - Email Reporting
 
