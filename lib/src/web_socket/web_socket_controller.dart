@@ -47,6 +47,8 @@ class WebSocketController {
 
   // State
   final List<WebSocketChannelEntity> _openedChannels = [];
+  final Map<String, Timer?> _reconnectTimers = {};
+  final Map<String, int> _reconnectAttempts = {};
   Timer? _heartbeatTimer;
 
   /// Get all open WebSocket channels
@@ -83,8 +85,6 @@ class WebSocketController {
         plcId: plcId,
         address: address,
         channel: channel,
-        logger: _logger,
-        onReconnect: _onChannelReconnected,
       );
 
       _openedChannels.add(wsChannel);
@@ -121,36 +121,149 @@ class WebSocketController {
         _logger.warning(
           'WebSocket connection to ${wsChannel.plcId} closed unexpectedly',
         );
-        wsChannel.isConnected = false;
+
+        // Update the channel with isConnected = false
+        _updateChannelConnectionState(wsChannel.plcId, false);
 
         // Start reconnection if auto-reconnect is enabled
         if (autoReconnect) {
-          wsChannel.startReconnection();
+          _startReconnection(wsChannel.plcId);
         }
       },
       onError: (error) {
         _logger.severe(
           'WebSocket error for ${wsChannel.plcId}: $error',
         );
-        wsChannel.isConnected = false;
+
+        // Update the channel with isConnected = false
+        _updateChannelConnectionState(wsChannel.plcId, false);
 
         // Start reconnection if auto-reconnect is enabled
         if (autoReconnect) {
-          wsChannel.startReconnection();
+          _startReconnection(wsChannel.plcId);
         }
       },
     );
   }
 
-  /// Callback when a channel is reconnected
-  void _onChannelReconnected(WebSocketChannelEntity channel) {
-    _logger.info('Channel ${channel.plcId} reconnected, setting up listeners');
+  /// Update the connection state of a channel
+  void _updateChannelConnectionState(String plcId, bool isConnected) {
+    final index =
+        _openedChannels.indexWhere((channel) => channel.plcId == plcId);
+    if (index != -1) {
+      final channel = _openedChannels[index];
+      _openedChannels[index] = channel.copyWith(isConnected: isConnected);
+    }
+  }
 
-    // Set up listeners for the new channel
-    _setupChannelListeners(channel);
+  /// Calculate the delay for the next reconnection attempt using exponential backoff
+  int _getNextReconnectDelay(String plcId) {
+    final attempts = _reconnectAttempts[plcId] ?? 0;
+    // Calculate delay with exponential backoff: baseDelay * 2^attempts
+    // But cap it at maxReconnectDelay
+    final delay = baseReconnectDelay * (1 << attempts);
+    return delay < maxReconnectDelay ? delay : maxReconnectDelay;
+  }
 
-    // Send initial update request
-    channel.channel.sink.add(_kWssUpdateBody);
+  /// Start reconnection attempts for a channel
+  void _startReconnection(String plcId) {
+    // Cancel any existing reconnection timer
+    _stopReconnection(plcId);
+
+    // Reset reconnection attempts
+    _reconnectAttempts[plcId] = 0;
+
+    // Schedule reconnection
+    _scheduleReconnect(plcId);
+  }
+
+  /// Stop reconnection attempts for a channel
+  void _stopReconnection(String plcId) {
+    _reconnectTimers[plcId]?.cancel();
+    _reconnectTimers[plcId] = null;
+    _reconnectAttempts.remove(plcId);
+  }
+
+  /// Schedule the next reconnection attempt
+  void _scheduleReconnect(String plcId) {
+    final attempts = _reconnectAttempts[plcId] ?? 0;
+
+    if (attempts >= maxReconnectAttempts) {
+      _logger.severe('Maximum reconnection attempts reached for $plcId');
+      _stopReconnection(plcId);
+      return;
+    }
+
+    final delay = _getNextReconnectDelay(plcId);
+    _logger.info(
+      'Scheduling reconnection attempt ${attempts + 1} for $plcId in ${delay}ms',
+    );
+
+    _reconnectTimers[plcId] = Timer(
+      Duration(milliseconds: delay),
+      () => _attemptReconnect(plcId),
+    );
+  }
+
+  /// Attempt to reconnect to the WebSocket
+  void _attemptReconnect(String plcId) {
+    // Increment reconnection attempts
+    _reconnectAttempts[plcId] = (_reconnectAttempts[plcId] ?? 0) + 1;
+
+    // Find the channel
+    final index =
+        _openedChannels.indexWhere((channel) => channel.plcId == plcId);
+    if (index == -1) {
+      _logger.warning('Cannot reconnect: channel $plcId not found');
+      _stopReconnection(plcId);
+      return;
+    }
+
+    final channel = _openedChannels[index];
+
+    try {
+      _logger.info(
+        'Attempting to reconnect to ${channel.plcId} at ${channel.address} (attempt ${_reconnectAttempts[plcId]})',
+      );
+
+      // Close the old channel if it's still open
+      try {
+        channel.channel.sink.close();
+      } catch (e) {
+        // Ignore errors when closing the old channel
+      }
+
+      // Create a new channel
+      final newChannel = WebSocketChannel.connect(
+        Uri.parse(WebSocketChannelEntity.addressPrefix + channel.address),
+        protocols: WebSocketChannelEntity.protocols,
+      );
+
+      // Create a new entity with the new channel and isConnected = true
+      final newEntity = channel.copyWith(
+        channel: newChannel,
+        isConnected: true,
+      );
+
+      // Replace the old entity with the new one
+      _openedChannels[index] = newEntity;
+
+      // Set up listeners for the new channel
+      _setupChannelListeners(newEntity);
+
+      // Send initial update request
+      newChannel.sink.add(_kWssUpdateBody);
+
+      _logger.info(
+        'Successfully reconnected to ${channel.plcId} at ${channel.address}',
+      );
+      _stopReconnection(plcId);
+    } catch (e) {
+      _logger.warning(
+        'Failed to reconnect to ${channel.plcId} at ${channel.address}: $e',
+      );
+      _scheduleReconnect(plcId);
+    }
   }
 
   // MARK: - Disconnection
@@ -206,9 +319,9 @@ class WebSocketController {
       channel.channel.sink.add(message);
     } catch (e) {
       _logger.severe('Error sending state update request: $e');
-      channel.isConnected = false;
+      _updateChannelConnectionState(plcId, false);
       if (autoReconnect) {
-        channel.startReconnection();
+        _startReconnection(plcId);
       }
     }
   }
@@ -219,10 +332,14 @@ class WebSocketController {
   void _disconnectChannel(WebSocketChannelEntity channel) {
     try {
       // Stop any reconnection attempts
-      channel.stopReconnection();
+      _stopReconnection(channel.plcId);
 
-      // Dispose the channel
-      channel.dispose();
+      // Close the channel
+      try {
+        channel.channel.sink.close();
+      } catch (e) {
+        _logger.warning('Error closing channel for ${channel.plcId}: $e');
+      }
 
       _logger.info(
         'WebSocket for ${channel.plcId} with ${channel.address} disconnected',
@@ -277,9 +394,9 @@ class WebSocketController {
       channel.channel.sink.add(message);
     } catch (e) {
       _logger.severe('Error sending message to $plcId: $e');
-      channel.isConnected = false;
+      _updateChannelConnectionState(plcId, false);
       if (autoReconnect) {
-        channel.startReconnection();
+        _startReconnection(plcId);
       }
     }
   }
@@ -319,9 +436,9 @@ class WebSocketController {
         channel.channel.sink.add(_kHeartbeatMessage);
       } catch (e) {
         _logger.warning('Error sending heartbeat to ${channel.plcId}: $e');
-        channel.isConnected = false;
+        _updateChannelConnectionState(channel.plcId, false);
         if (autoReconnect) {
-          channel.startReconnection();
+          _startReconnection(channel.plcId);
         }
       }
     }
@@ -339,6 +456,12 @@ class WebSocketController {
   /// Dispose of resources
   void dispose() {
     _stopHeartbeatTimer();
+
+    // Stop all reconnection timers
+    for (final plcId in _reconnectTimers.keys.toList()) {
+      _stopReconnection(plcId);
+    }
+
     disconnectAll();
   }
 }
