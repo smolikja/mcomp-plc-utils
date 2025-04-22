@@ -254,6 +254,10 @@ Helper class for managing Firebase Cloud Messaging (FCM) across different applic
 - Prevents duplicate processing of notifications
 - Provides callbacks for notification data processing and tap handling
 
+#### Setup
+
+Before using the Cloud Messaging Helper, you need to set up the notification icon for Android. See the [Notification Icon Setup](docs/notification_icon_setup.md) guide for detailed instructions.
+
 #### Example
 
 ```dart
